@@ -1,0 +1,179 @@
+"""
+Visium HD Spatial Transcriptomics Analysis Pipeline
+Author: Hyosung Kim, Ph.D.
+Date: 2026-01-12
+Description:
+    This script loads 4 Visium HD samples, merges them into a single AnnData object,
+    performs normalization, and visualizes key marker genes side-by-side 
+    with a consistent color scale for direct comparison (e.g., WT vs 5xFAD).
+"""
+
+import scanpy as sc
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+import numpy as np
+
+# ==============================================================================
+# 1. Function to Load Visium HD Data Safely
+# ==============================================================================
+def load_visium_hd_safe(base_path, sample_name):
+    """
+    Loads Visium HD data from the specified path.
+    Handles H5 feature matrices and spatial coordinates (Parquet or CSV).
+    Adjusts coordinate orientation for correct visualization.
+    """
+    # Construct the path to the 16um bin folder
+    # Adjust 'square_016um' to 'square_008um' if higher resolution is needed.
+    data_path = os.path.join(base_path, sample_name, "binned_outputs", "square_016um")
+    print(f"[{sample_name}] Loading data from: {data_path}")
+    
+    # 1. Load the Filtered Feature Matrix (.h5)
+    h5_file = os.path.join(data_path, "filtered_feature_bc_matrix.h5")
+    if not os.path.exists(h5_file):
+        print(f" [Error] File not found: {h5_file}")
+        return None
+
+    adata = sc.read_10x_h5(h5_file)
+    adata.var_names_make_unique()
+    
+    # 2. Load Spatial Coordinates
+    spatial_path = os.path.join(data_path, "spatial")
+    parquet_file = os.path.join(spatial_path, "tissue_positions.parquet")
+    
+    if os.path.exists(parquet_file):
+        # Visium HD uses parquet files for efficiency
+        coords = pd.read_parquet(parquet_file)
+        if 'barcode' in coords.columns:
+            coords = coords.set_index('barcode')
+        else:
+            coords = coords.set_index(coords.columns[0])
+    else:
+        # Fallback to CSV if parquet is missing
+        csv_file = os.path.join(spatial_path, "tissue_positions.csv")
+        if os.path.exists(csv_file):
+            coords = pd.read_csv(csv_file, index_col=0)
+        else:
+            print(f" [Error] No spatial coordinates found in {spatial_path}")
+            return None
+
+    # 3. Match Barcodes (Intersection of Matrix and Coordinates)
+    common_barcodes = adata.obs_names.intersection(coords.index)
+    adata = adata[common_barcodes, :]
+    coords = coords.loc[common_barcodes]
+    
+    # 4. Store Coordinates in adata.obsm
+    # Note: Y-axis is inverted (-1) to match the image orientation in standard plots
+    spatial_coords = coords[['pxl_col_in_fullres', 'pxl_row_in_fullres']].values
+    spatial_coords[:, 1] *= -1 
+    adata.obsm['spatial'] = spatial_coords
+    
+    # 5. Add Batch Information
+    adata.obs['batch'] = sample_name
+    
+    return adata
+
+# ==============================================================================
+# 2. Main Execution: Load and Merge 4 Samples
+# ==============================================================================
+# Define the root directory containing the CellRanger output folders
+root_path = r"E:/20251117_Visium/CellRanger"
+
+# List of sample folder names
+sample_list = ["13604-RE-1", "13604-RE-2", "13604-RE-3", "13604-RE-4"]
+
+adatas = []
+for sample in sample_list:
+    adata = load_visium_hd_safe(root_path, sample)
+    if adata is not None:
+        adatas.append(adata)
+
+if not adatas:
+    raise ValueError("No data loaded. Check the paths.")
+
+print("\nMerging 4 samples into a single object...")
+# Outer join allows merging even if some genes are missing in one sample
+adata_combined = sc.concat(adatas, label="batch", keys=sample_list, join="outer")
+
+# Fill NaN values (missing genes) with 0
+adata_combined.X = np.nan_to_num(adata_combined.X, nan=0)
+
+print(f"Merge complete! Total bins: {adata_combined.n_obs}")
+
+# ==============================================================================
+# 3. Preprocessing & Normalization
+# ==============================================================================
+print("Normalizing data (Library size correction & Log transformation)...")
+sc.pp.normalize_total(adata_combined, target_sum=1e4)
+sc.pp.log1p(adata_combined)
+
+# ==============================================================================
+# 4. Visualization: 4-Panel Comparative Plot
+# ==============================================================================
+output_dir = "Visium_HD_Analysis_Results"
+os.makedirs(output_dir, exist_ok=True)
+
+# List of Marker Genes to Visualize
+# Gfap: Reactive Astrocytes (High in 5xFAD)
+# Trem2, Cst7: Disease-Associated Microglia (DAM, High in 5xFAD)
+# C1qa: Complement/Inflammation
+# Mbp: Oligodendrocytes (Myelin)
+# Rbfox3: Neurons (NeuN)
+target_genes = ["Gfap", "Trem2", "Cst7", "C1qa", "Mbp", "Rbfox3"]
+
+# Filter genes that actually exist in the dataset
+valid_genes = [g for g in target_genes if g in adata_combined.var_names]
+
+if valid_genes:
+    print(f"\nStarting comparison for genes: {valid_genes}")
+    
+    for gene in valid_genes:
+        # 1. Calculate Common Color Scale (Vmax)
+        # Using the 99.8th percentile of expression across ALL samples ensures fair comparison.
+        if hasattr(adata_combined[:, gene].X, "toarray"):
+            vals = adata_combined[:, gene].X.toarray()
+        else:
+            vals = adata_combined[:, gene].X
+        
+        vmax_val = np.percentile(vals, 99.8)
+        if vmax_val == 0: vmax_val = 1.0 # Avoid error for low expression genes
+        
+        print(f" - Plotting {gene}... (Max Scale: {vmax_val:.2f})")
+
+        # 2. Create Figure (1 Row, 4 Columns)
+        fig, axes = plt.subplots(1, 4, figsize=(24, 6))
+        
+        for i, sample in enumerate(sample_list):
+            # Subset data for the current sample
+            subset = adata_combined[adata_combined.obs['batch'] == sample]
+            
+            # Plot spatial coordinates
+            # 'basis="spatial"' uses the coordinates stored in adata.obsm['spatial']
+            sc.pl.embedding(
+                subset, 
+                basis="spatial", 
+                color=gene, 
+                ax=axes[i], 
+                vmax=vmax_val, # Critical: Apply same color scale
+                cmap="magma", 
+                s=10,          # Spot size
+                show=False,
+                title=f"{gene} - {sample}"
+            )
+            axes[i].axis('off') # Hide axes
+
+        # 3. Save Figure
+        save_path = f"{output_dir}/Comparison_{gene}.png"
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f" -> Saved: {save_path}")
+
+    print(f"\nAnalysis complete! Results saved in '{output_dir}'.")
+    
+    # Open output directory (Windows only)
+    try:
+        os.startfile(output_dir)
+    except AttributeError:
+        pass # Skip on MacOS/Linux
+else:
+    print("[Warning] None of the target genes were found in the dataset.")
