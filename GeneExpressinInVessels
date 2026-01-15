@@ -1,0 +1,237 @@
+import scanpy as sc
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import numpy as np
+from sklearn.mixture import GaussianMixture
+from sklearn.neighbors import NearestNeighbors # ★ Key Addition: Neighbor Search Tool
+from scipy.stats import ranksums
+import gc
+
+# ==============================================================================
+# 1. Load 16µm Data
+# ==============================================================================
+def load_visium_hd_16um(base_path, sample_name):
+    # Switch back to square_016um folder
+    data_path = os.path.join(base_path, sample_name, "binned_outputs", "square_016um")
+    print(f"[{sample_name}] Loading 16µm data... ({data_path})")
+    
+    h5_file = os.path.join(data_path, "filtered_feature_bc_matrix.h5")
+    if not os.path.exists(h5_file):
+        print(f" [Error] File not found: {h5_file}")
+        return None
+
+    adata = sc.read_10x_h5(h5_file)
+    adata.var_names_make_unique()
+    
+    # Load coordinates
+    spatial_path = os.path.join(data_path, "spatial")
+    parquet_file = os.path.join(spatial_path, "tissue_positions.parquet")
+    
+    if os.path.exists(parquet_file):
+        coords = pd.read_parquet(parquet_file)
+        if 'barcode' in coords.columns:
+            coords = coords.set_index('barcode')
+        else:
+            coords = coords.set_index(coords.columns[0])
+    else:
+        csv_file = os.path.join(spatial_path, "tissue_positions.csv")
+        coords = pd.read_csv(csv_file, index_col=0)
+
+    # Match intersection
+    common = adata.obs_names.intersection(coords.index)
+    adata = adata[common, :]
+    coords = coords.loc[common]
+    
+    # Invert Y-axis
+    spatial_coords = coords[['pxl_col_in_fullres', 'pxl_row_in_fullres']].values
+    spatial_coords[:, 1] *= -1 
+    adata.obsm['spatial'] = spatial_coords
+    adata.obs['batch'] = sample_name
+    
+    return adata
+
+# ==============================================================================
+# 2. Data Integration
+# ==============================================================================
+root_path = r"E:/20251117_Visium/CellRanger"
+sample_list = ["13604-RE-1", "13604-RE-2", "13604-RE-3", "13604-RE-4"]
+
+adatas = []
+for sample in sample_list:
+    adata = load_visium_hd_16um(root_path, sample)
+    if adata is not None:
+        adatas.append(adata)
+
+print("\nMerging 4 samples into one...")
+adata_combined = sc.concat(adatas, label="batch", keys=sample_list, join="outer")
+del adatas
+gc.collect()
+
+# ==============================================================================
+# [Sanity Check] Verify Glut1 (Slc2a1)
+# ==============================================================================
+glut1_gene = 'Slc2a1'
+if glut1_gene in adata_combined.var_names:
+    total_counts = adata_combined[:, glut1_gene].X.sum()
+    print(f"\n==================================================")
+    print(f"★ [Diagnosis] Total counts of {glut1_gene} in entire dataset: {int(total_counts)}")
+    print(f"   (Number of bins: {adata_combined.n_obs})")
+    if total_counts < 100:
+        print("   [Warning] Expression is extremely low. High possibility of technical detection failure.")
+    else:
+        print("   [Good] Signal level is sufficient for analysis.")
+    print(f"==================================================\n")
+else:
+    print(f"[Fatal Error] Gene {glut1_gene} does not exist in the data!")
+
+# Normalization
+print("Performing data normalization (Log-normalization)...")
+sc.pp.normalize_total(adata_combined, target_sum=1e4)
+sc.pp.log1p(adata_combined)
+
+# Map sample conditions
+sample_conditions = {
+    "13604-RE-1": "WT", "13604-RE-4": "WT",
+    "13604-RE-2": "5xFAD", "13604-RE-3": "5xFAD"
+}
+adata_combined.obs['Condition'] = adata_combined.obs['batch'].map(sample_conditions)
+
+# ==============================================================================
+# 3. WM/GM Segmentation (Weighted GMM)
+# ==============================================================================
+print("\n[Step 1] Automated WM/GM segmentation (GMM)...")
+wm_genes = {'Mbp': 3.0, 'Plp1': 3.0, 'Mog': 1.0, 'Mag': 1.0, 'Cnp': 1.0}
+available_genes = {g: w for g, w in wm_genes.items() if g in adata_combined.var_names}
+
+wm_score = np.zeros(adata_combined.n_obs)
+for gene, weight in available_genes.items():
+    if hasattr(adata_combined[:, gene].X, "toarray"):
+        expr = adata_combined[:, gene].X.toarray().flatten()
+    else:
+        expr = adata_combined[:, gene].X.flatten()
+    wm_score += expr * weight
+
+gmm_wm = GaussianMixture(n_components=2, random_state=42)
+gmm_wm.fit(wm_score.reshape(-1, 1))
+labels_wm = gmm_wm.predict(wm_score.reshape(-1, 1))
+wm_label = 0 if wm_score.reshape(-1, 1)[labels_wm==0].mean() > wm_score.reshape(-1, 1)[labels_wm==1].mean() else 1
+adata_combined.obs['Region_Type'] = np.where(labels_wm == wm_label, 'WM', 'GM')
+
+# ==============================================================================
+# 4. Automated Vessel Designation (GMM Statistical Thresholding)
+# ==============================================================================
+print("\n[Step 2] Automated Vessel region detection (GMM)...")
+vascular_genes = ['Cldn5', 'Flt1', 'Pecam1', 'Slco1c1', 'Vwf', 'Abcb1a']
+valid_vascular_genes = [g for g in vascular_genes if g in adata_combined.var_names]
+sc.tl.score_genes(adata_combined, valid_vascular_genes, score_name='Vessel_Score')
+
+# Segment vessels using GMM
+vessel_scores = adata_combined.obs['Vessel_Score'].values.reshape(-1, 1)
+gmm_vessel = GaussianMixture(n_components=2, random_state=42)
+gmm_vessel.fit(vessel_scores)
+vessel_labels = gmm_vessel.predict(vessel_scores)
+
+# Determine the group with higher mean score as 'True Vessel'
+if vessel_scores[vessel_labels==0].mean() > vessel_scores[vessel_labels==1].mean():
+    true_vessel_label = 0
+else:
+    true_vessel_label = 1
+
+adata_combined.obs['Is_Vessel'] = (vessel_labels == true_vessel_label)
+vessel_count = adata_combined.obs['Is_Vessel'].sum()
+print(f" -> Number of identified vessel bins: {vessel_count}")
+
+# ==============================================================================
+# 5. [★Key Modification] Neighborhood Accumulation Method
+# ==============================================================================
+print("\n[Step 3] Applying Neighborhood Accumulation...")
+
+if glut1_gene in adata_combined.var_names:
+    # Initialize column to store results
+    adata_combined.obs['Glut1_Accumulated'] = 0.0
+    
+    # Loop through samples (Coordinates are independent for each sample)
+    for sample in sample_list:
+        print(f" -> Processing {sample}...")
+        
+        # Extract data for the current sample
+        batch_indices = adata_combined.obs['batch'] == sample
+        subset = adata_combined[batch_indices]
+        
+        # 1. Prepare coordinates and data
+        coords = subset.obsm['spatial']
+        if hasattr(subset[:, glut1_gene].X, "toarray"):
+            gene_data = subset[:, glut1_gene].X.toarray().flatten()
+        else:
+            gene_data = subset[:, glut1_gene].X.flatten()
+            
+        # 2. Find Neighbors (Nearest Neighbors)
+        # n_neighbors=9 : Search 8 neighbors including self (3x3 grid)
+        nbrs = NearestNeighbors(n_neighbors=9, algorithm='ball_tree').fit(coords)
+        distances, indices = nbrs.kneighbors(coords)
+        
+        # 3. Accumulation
+        # gene_data[indices] becomes an array of shape (N_cells, 9)
+        # Summing along axis=1 adds up expression of all neighbors
+        accumulated_data = np.sum(gene_data[indices], axis=1)
+        
+        # 4. Store in original data
+        adata_combined.obs.loc[batch_indices, 'Glut1_Accumulated'] = accumulated_data
+    
+    print(" -> Accumulation complete. Starting analysis.")
+
+    # ==========================================================================
+    # 6. Plotting Results (Using Accumulated Values)
+    # ==========================================================================
+    output_dir = "Visium_HD_Accumulation_Analysis"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Extract only vessel regions
+    df_vessel = adata_combined.obs[adata_combined.obs['Is_Vessel'] == True].copy()
+    
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    regions = ['WM', 'GM']
+    
+    for i, region in enumerate(regions):
+        subset = df_vessel[df_vessel['Region_Type'] == region]
+        
+        sns.boxplot(
+            data=subset,
+            x='Condition',
+            y='Glut1_Accumulated', # ★ Using modified variable
+            order=['WT', '5xFAD'],
+            palette={'WT': 'lightgray', '5xFAD': 'firebrick'},
+            showfliers=False,
+            ax=axes[i],
+            width=0.5
+        )
+        axes[i].set_title(f"Accumulated Glut1 in {region} Vessels", fontsize=14, fontweight='bold')
+        axes[i].set_ylabel("Accumulated Expression (Neighbor Sum)")
+        axes[i].set_xlabel("")
+        
+        # Statistical Test
+        val_wt = subset[subset['Condition']=='WT']['Glut1_Accumulated']
+        val_ad = subset[subset['Condition']=='5xFAD']['Glut1_Accumulated']
+        
+        if len(val_wt) > 0 and len(val_ad) > 0:
+            stat, pval = ranksums(val_wt, val_ad)
+            
+            y_max = subset['Glut1_Accumulated'].quantile(0.99)
+            if np.isnan(y_max) or y_max == 0: y_max = 0.1 # Handle case where value is 0
+            
+            axes[i].text(0.5, y_max, f"P = {pval:.2e}", ha='center', va='bottom', fontsize=12, color='black')
+            print(f"[{region}] Accumulated Glut1 comparison in vessels -> P-value: {pval:.4e}")
+
+    plt.tight_layout()
+    save_path = f"{output_dir}/Glut1_Accumulated_Comparison.png"
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    
+    print(f"\nAnalysis complete! Result graph: {save_path}")
+    try: os.startfile(output_dir)
+    except: pass
+
+else:
+    print(f"[Error] Gene {glut1_gene} does not exist in the data.")
