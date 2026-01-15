@@ -1,0 +1,193 @@
+import scanpy as sc
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import numpy as np
+from sklearn.mixture import GaussianMixture
+
+# ==============================================================================
+# 1. Data Loading Function (Safe Mode + Y-axis Inversion)
+# ==============================================================================
+def load_visium_hd_safe(base_path, sample_name):
+    # Automatically generate folder path
+    data_path = os.path.join(base_path, sample_name, "binned_outputs", "square_016um")
+    print(f"[{sample_name}] Loading data... ({data_path})")
+    
+    # Load H5
+    h5_file = os.path.join(data_path, "filtered_feature_bc_matrix.h5")
+    if not os.path.exists(h5_file):
+        print(f" [Warning] File not found: {h5_file}")
+        return None
+
+    adata = sc.read_10x_h5(h5_file)
+    adata.var_names_make_unique()
+    
+    # Load coordinates
+    spatial_path = os.path.join(data_path, "spatial")
+    parquet_file = os.path.join(spatial_path, "tissue_positions.parquet")
+    
+    if os.path.exists(parquet_file):
+        coords = pd.read_parquet(parquet_file)
+        if 'barcode' in coords.columns:
+            coords = coords.set_index('barcode')
+        else:
+            coords = coords.set_index(coords.columns[0])
+    else:
+        csv_file = os.path.join(spatial_path, "tissue_positions.csv")
+        coords = pd.read_csv(csv_file, index_col=0)
+
+    # Match intersection
+    common = adata.obs_names.intersection(coords.index)
+    adata = adata[common, :]
+    coords = coords.loc[common]
+    
+    # Input coordinates (Invert Y-axis)
+    spatial_coords = coords[['pxl_col_in_fullres', 'pxl_row_in_fullres']].values
+    spatial_coords[:, 1] *= -1 
+    adata.obsm['spatial'] = spatial_coords
+    
+    # Add batch information
+    adata.obs['batch'] = sample_name
+    
+    return adata
+
+# ==============================================================================
+# 2. Load and Merge 4 Samples
+# ==============================================================================
+root_path = r"E:/20251117_Visium/CellRanger"
+sample_list = ["13604-RE-1", "13604-RE-2", "13604-RE-3", "13604-RE-4"]
+
+adatas = []
+for sample in sample_list:
+    adata = load_visium_hd_safe(root_path, sample)
+    if adata is not None:
+        adatas.append(adata)
+
+print("\nMerging 4 samples...")
+adata_combined = sc.concat(adatas, label="batch", keys=sample_list, join="outer")
+adata_combined.X = np.nan_to_num(adata_combined.X, nan=0)
+
+print(f"Merge complete! Total bins: {adata_combined.n_obs}")
+
+# ==============================================================================
+# 3. Integrated Normalization
+# ==============================================================================
+print("Performing integrated data normalization...")
+sc.pp.normalize_total(adata_combined, target_sum=1e4)
+sc.pp.log1p(adata_combined)
+
+# ==============================================================================
+# 4. Define Sample Groups (WT vs 5xFAD)
+# ==============================================================================
+sample_conditions = {
+    "13604-RE-1": "WT",    # Wild Type
+    "13604-RE-4": "WT",    # Wild Type
+    "13604-RE-2": "5xFAD", # Alzheimer Model
+    "13604-RE-3": "5xFAD"  # Alzheimer Model
+}
+# Map conditions to data
+adata_combined.obs['Condition'] = adata_combined.obs['batch'].map(sample_conditions)
+print(f"Sample group setup complete: {sample_conditions}")
+
+# ==============================================================================
+# 5. Weighted WM/GM Automated Segmentation
+# ==============================================================================
+def classify_wm_gm_weighted(adata):
+    print("\n[Step 1] Starting weighted WM/GM segmentation...")
+    
+    # Assign high weights to core Myelin genes
+    gene_weights = {
+        'Mbp': 3.0, 'Plp1': 3.0, 'Mog': 1.0, 'Mag': 1.0, 'Cnp': 1.0, 'Ugt8a': 1.0
+    }
+    
+    available_genes = {g: w for g, w in gene_weights.items() if g in adata.var_names}
+    
+    # Calculate weighted score
+    wm_score = np.zeros(adata.n_obs)
+    for gene, weight in available_genes.items():
+        if hasattr(adata[:, gene].X, "toarray"):
+            expression = adata[:, gene].X.toarray().flatten()
+        else:
+            expression = adata[:, gene].X.flatten()
+        wm_score += expression * weight
+        
+    adata.obs['Weighted_WM_Score'] = wm_score
+    
+    # Automatic thresholding using GMM
+    X = wm_score.reshape(-1, 1)
+    gmm = GaussianMixture(n_components=2, random_state=42)
+    gmm.fit(X)
+    labels = gmm.predict(X)
+    
+    # Higher score indicates WM
+    if X[labels == 0].mean() > X[labels == 1].mean():
+        wm_label = 0
+    else:
+        wm_label = 1
+    
+    adata.obs['Region_Type'] = np.where(labels == wm_label, 'WM', 'GM')
+    return adata
+
+# Execute WM/GM segmentation
+adata_combined = classify_wm_gm_weighted(adata_combined)
+
+# ==============================================================================
+# 6. Aging Score Calculation and Comparison
+# ==============================================================================
+print("\n[Step 2] Calculating Aging Scores and performing comparative analysis...")
+
+aging_gene_sets = {
+    'Senescence_Score': ['Cdkn2a', 'Cdkn1a', 'Trp53', 'Glb1', 'Cdkn2b'],
+    'SASP_Score': ['Il6', 'Il1b', 'Tnf', 'Ccl2', 'Cxcl10', 'Mmp3', 'Mmp9', 'Serpine1'],
+    'Inflammaging_Score': ['Spp1', 'Gpnmb', 'Clec7a', 'Apoe', 'Cst7', 'Trem2'] 
+}
+
+# Calculate scores
+for score_name, genes in aging_gene_sets.items():
+    valid_genes = [g for g in genes if g in adata_combined.var_names]
+    sc.tl.score_genes(adata_combined, valid_genes, score_name=score_name)
+
+# ==============================================================================
+# 7. Visualize and Save Results
+# ==============================================================================
+output_dir = "Visium_HD_Aging_Analysis"
+os.makedirs(output_dir, exist_ok=True)
+
+# Extract DataFrame
+df_plot = adata_combined.obs[['batch', 'Condition', 'Region_Type', 'Senescence_Score', 'SASP_Score', 'Inflammaging_Score']].copy()
+df_plot = df_plot[df_plot['Region_Type'].isin(['WM', 'GM'])]
+
+# Draw box plots
+fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+for i, (score_name, _) in enumerate(aging_gene_sets.items()):
+    sns.boxplot(
+        data=df_plot, 
+        x='Region_Type', 
+        y=score_name, 
+        hue='Condition', 
+        palette={'WT': 'lightgray', '5xFAD': 'firebrick'}, 
+        ax=axes[i],
+        showfliers=False,
+        width=0.6
+    )
+    axes[i].set_title(f"{score_name}", fontsize=14, fontweight='bold')
+    axes[i].set_xlabel("Brain Region", fontsize=12)
+    axes[i].set_ylabel("Score", fontsize=12)
+    
+    if i == 2:
+        axes[i].legend(loc='upper right', title='Genotype')
+    else:
+        axes[i].get_legend().remove()
+
+plt.tight_layout()
+save_path = f"{output_dir}/Aging_Score_Comparison_Full.png"
+plt.savefig(save_path, dpi=300)
+plt.close()
+
+print(f"\nAll analyses complete! Check the '{output_dir}' folder.")
+try:
+    os.startfile(output_dir)
+except:
+    pass
