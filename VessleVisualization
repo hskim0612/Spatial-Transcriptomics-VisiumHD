@@ -1,0 +1,114 @@
+import scanpy as sc
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+import gc
+from scipy.ndimage import gaussian_filter  # ★ Key: Library for smoothing function
+
+# ==============================================================================
+# 1. Configuration
+# ==============================================================================
+base_path = r"E:/20251117_Visium/CellRanger/13604-RE-1/binned_outputs/square_002um"
+h5_file = os.path.join(base_path, "filtered_feature_bc_matrix.h5")
+spatial_path = os.path.join(base_path, "spatial")
+save_path = os.path.join(base_path, "Vessel_Density_Map_Smoothed.png") # Save path
+
+# Pan-Endothelial + Basement Membrane Panel (27 Genes)
+pan_vessel_genes = [
+    'Slc2a1', 'Col4a1', 'Col4a2', 'Pecam1', 'Cdh5', 'Vwf', 'Cd34', 'Emcn',
+    'Kdr', 'Flt1', 'Tek', 'Tie1', 'Eng', 'Nrp1', 'Ptprb',
+    'Cldn5', 'Tfrc', 'Mfsd2a', 'Abcb1a', 'Nos3',
+    'Icam2', 'Podxl', 'Mcam', 'Bsg', 'Erg', 'Fli1', 'Sox7'
+]
+
+print(f"🚀 [Start] Vessel Density Mapping (Strategy B: KDE Smoothing)")
+
+# ==============================================================================
+# 2. Load Data and 1/4 Cropping
+# ==============================================================================
+adata = sc.read_10x_h5(h5_file)
+adata.var_names_make_unique()
+
+tissue_pos = pd.read_parquet(os.path.join(spatial_path, "tissue_positions.parquet"))
+if 'barcode' in tissue_pos.columns: tissue_pos = tissue_pos.set_index('barcode')
+
+common = adata.obs_names.intersection(tissue_pos.index)
+adata = adata[common, :]
+coords = tissue_pos.loc[common, ['pxl_col_in_fullres', 'pxl_row_in_fullres']].values
+# Invert y-axis (Align with image coordinates)
+coords[:, 1] *= -1 
+
+# Top-Right Cropping
+x_mid = (coords[:, 0].min() + coords[:, 0].max()) / 2
+y_mid = (coords[:, 1].min() + coords[:, 1].max()) / 2
+mask = (coords[:, 0] > x_mid) & (coords[:, 1] > y_mid)
+
+adata = adata[mask, :]
+coords = coords[mask, :]
+
+# ==============================================================================
+# 3. Aggregate Markers (Calculate Vessel Score)
+# ==============================================================================
+valid_markers = [g for g in pan_vessel_genes if g in adata.var_names]
+print(f" -> Used Markers: {len(valid_markers)} genes")
+
+gene_data = adata[:, valid_markers].X
+if hasattr(gene_data, "toarray"):
+    total_counts = np.sum(gene_data.toarray(), axis=1)
+else:
+    total_counts = np.sum(gene_data, axis=1)
+
+# Extract coordinates with vessel signals only (Keep counts for weighting)
+vessel_indices = np.where(total_counts > 0)[0]
+vessel_coords = coords[vessel_indices]
+vessel_weights = total_counts[vessel_indices] # Higher expression shown more intensely
+
+# ==============================================================================
+# 4. Visualization (Strategy B: KDE / Gaussian Smoothing)
+# ==============================================================================
+# (1) Create Canvas (Grid)
+# Calculate coordinate range
+x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
+y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
+
+# Set Resolution (Grid Size) - Higher numbers mean higher resolution but slower processing
+resolution = 2000 
+x_bins = np.linspace(x_min, x_max, resolution)
+y_bins = np.linspace(y_min, y_max, resolution)
+
+# (2) Generate 2D Histogram (Map coordinates to grid)
+heatmap, x_edges, y_edges = np.histogram2d(
+    vessel_coords[:, 0], 
+    vessel_coords[:, 1], 
+    bins=[x_bins, y_bins], 
+    weights=vessel_weights # Apply expression weight
+)
+
+# (3) Apply Gaussian Smoothing (Blur Effect)
+# Adjust sigma value to determine 'blur' extent (Recommended: 2~5)
+# Larger sigma results in smoother, more connected appearance.
+sigma_val = 3.0 
+smoothed_heatmap = gaussian_filter(heatmap.T, sigma=sigma_val)
+
+# (4) Plot and Save
+plt.figure(figsize=(12, 12), facecolor='black')
+
+# Display heatmap using imshow
+plt.imshow(
+    smoothed_heatmap, 
+    extent=[x_min, x_max, y_min, y_max], 
+    origin='lower', 
+    cmap='magma',  # Recommended fiery colormaps: 'magma', 'inferno', 'afmhot'
+    interpolation='nearest'
+)
+
+plt.title(f"Vessel Density Map (Smoothed, Sigma={sigma_val})\nTop-Right Quadrant", 
+          color='white', fontsize=15)
+plt.axis('off')
+
+# Save file
+plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='black')
+print(f"✅ [Save Complete] File generated at: {save_path}")
+
+plt.show()
