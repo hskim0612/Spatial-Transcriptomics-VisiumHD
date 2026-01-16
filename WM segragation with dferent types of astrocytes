@@ -1,0 +1,236 @@
+import scanpy as sc
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import numpy as np
+from sklearn.neighbors import NearestNeighbors
+from sklearn.mixture import GaussianMixture
+import gc
+
+# ==============================================================================
+# 1. Data Loading and Neighborhood Accumulation 
+#    (Addressing Sparsity + Including WM/GM Markers)
+# ==============================================================================
+def process_sample_accumulated(base_path, sample_name):
+    data_path = os.path.join(base_path, sample_name, "binned_outputs", "square_016um")
+    h5_file = os.path.join(data_path, "filtered_feature_bc_matrix.h5")
+    
+    if not os.path.exists(h5_file):
+        print(f" [Skip] File not found: {sample_name}")
+        return None
+
+    print(f"[{sample_name}] Loading and performing Neighborhood Accumulation...")
+    
+    # Load Data
+    adata = sc.read_10x_h5(h5_file)
+    adata.var_names_make_unique()
+    
+    # Load Coordinates
+    spatial_path = os.path.join(data_path, "spatial")
+    if os.path.exists(os.path.join(spatial_path, "tissue_positions.parquet")):
+        coords = pd.read_parquet(os.path.join(spatial_path, "tissue_positions.parquet"))
+        if 'barcode' in coords.columns: coords = coords.set_index('barcode')
+        else: coords = coords.set_index(coords.columns[0])
+    else:
+        coords = pd.read_csv(os.path.join(spatial_path, "tissue_positions.csv"), index_col=0)
+
+    common = adata.obs_names.intersection(coords.index)
+    adata = adata[common, :]
+    coords = coords.loc[common]
+    spatial_coords = coords[['pxl_col_in_fullres', 'pxl_row_in_fullres']].values
+    spatial_coords[:, 1] *= -1 
+    
+    # Normalization
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    
+    # --------------------------------------------------------------------------
+    # ★ CORE: Define all necessary genes (For WM/GM + State Classification)
+    # --------------------------------------------------------------------------
+    target_genes = [
+        # 1. WM/GM Markers
+        'Mbp', 'Plp1', 'Mog', 'Mag', 'Cnp', 'Ugt8a',
+        
+        # 2. Astrocyte Homeostatic
+        'Gfap', 'Aldh1l1', 'Slc1a2', 'Glul', 'Aqp4',
+        
+        # 3. Inflammation (Pathological)
+        'Nfkb1', 'Rel', 'Il1b', 'Tnf', 'Ccl2', 'Cxcl10', 'Stat3', 'C3', 'Serpina3n', 'H2-D1', 'Ggta1',
+        
+        # 4. Hypoxia (Pathological)
+        'Hif1a', 'Epas1', 'Vegfa', 'Slc2a1', 'Pgk1', 'Bnip3'
+    ]
+    valid_genes = [g for g in target_genes if g in adata.var_names]
+    
+    # Neighborhood Accumulation (3x3 Grid)
+    # Aggregating surrounding signals to solve the issue where "WM is mistaken for GM due to sparse dots"
+    nbrs = NearestNeighbors(n_neighbors=9, algorithm='kd_tree', n_jobs=-1).fit(spatial_coords)
+    indices = nbrs.kneighbors(spatial_coords, return_distance=False)
+    
+    data_dict = {'batch': sample_name, 'x': spatial_coords[:, 0], 'y': spatial_coords[:, 1]}
+    
+    for gene in valid_genes:
+        if hasattr(adata[:, gene].X, "toarray"): raw = adata[:, gene].X.toarray().flatten()
+        else: raw = adata[:, gene].X.flatten()
+        # Save accumulated values
+        data_dict[f'{gene}_accum'] = np.sum(raw[indices], axis=1)
+        
+    df = pd.DataFrame(data_dict, index=adata.obs_names)
+    del adata
+    gc.collect()
+    return df
+
+# Execution
+root_path = r"E:/20251117_Visium/CellRanger"
+sample_list = ["13604-RE-1", "13604-RE-2", "13604-RE-3", "13604-RE-4"]
+
+dfs = []
+print("Starting data preprocessing...")
+for sample in sample_list:
+    df_part = process_sample_accumulated(root_path, sample)
+    if df_part is not None: dfs.append(df_part)
+
+df_all = pd.concat(dfs, ignore_index=False)
+df_all['Condition'] = df_all['batch'].map({
+    "13604-RE-1": "WT", "13604-RE-4": "WT", 
+    "13604-RE-2": "5xFAD", "13604-RE-3": "5xFAD"
+})
+
+# ==============================================================================
+# 2. Weighted WM/GM Segmentation (Applying Accumulated Values)
+# ==============================================================================
+print("\n[Segmentation] WM/GM Region Segmentation (Weighted GMM)...")
+
+# Apply weights (Using the logic, but applying to accumulated values)
+gene_weights = {'Mbp': 3.0, 'Plp1': 3.0, 'Mog': 1.0, 'Mag': 1.0, 'Cnp': 1.0, 'Ugt8a': 1.0}
+
+wm_score = np.zeros(len(df_all))
+used_genes = []
+
+for gene, weight in gene_weights.items():
+    col_name = f"{gene}_accum"
+    if col_name in df_all.columns:
+        wm_score += df_all[col_name].values * weight
+        used_genes.append(gene)
+
+print(f" -> WM Markers used: {used_genes}")
+df_all['Weighted_WM_Score'] = wm_score
+
+# Apply GMM
+gmm = GaussianMixture(n_components=2, random_state=42)
+X = wm_score.reshape(-1, 1)
+labels = gmm.fit_predict(X)
+
+# Assign higher score cluster as WM
+if X[labels == 0].mean() > X[labels == 1].mean():
+    wm_label = 0
+else:
+    wm_label = 1
+
+df_all['Region_Type'] = np.where(labels == wm_label, 'WM', 'GM')
+print(f" -> WM Bins: {sum(df_all['Region_Type']=='WM')}, GM Bins: {sum(df_all['Region_Type']=='GM')}")
+
+# ==============================================================================
+# 3. Astrocyte State Classification (Unbiased)
+# ==============================================================================
+print("\n[Classification] Classifying Astrocyte States...")
+
+# Calculate Scores
+inflam_cols = [c for c in df_all.columns if c.replace('_accum','') in ['Nfkb1', 'Rel', 'Il1b', 'Tnf', 'Ccl2', 'Cxcl10', 'Stat3']]
+hypoxia_cols = [c for c in df_all.columns if c.replace('_accum','') in ['Hif1a', 'Epas1', 'Vegfa', 'Slc2a1', 'Pgk1', 'Bnip3']]
+homeo_cols = [c for c in df_all.columns if c.replace('_accum','') in ['Slc1a2', 'Glul', 'Aqp4', 'Aldh1l1']]
+
+df_all['Inflammation_Score'] = df_all[inflam_cols].sum(axis=1)
+df_all['Hypoxia_Score'] = df_all[hypoxia_cols].sum(axis=1)
+df_all['Homeostatic_Score'] = df_all[homeo_cols].sum(axis=1)
+
+# Set Thresholds (Top 25% based on total data)
+th_inflam = df_all['Inflammation_Score'].quantile(0.75)
+th_hypoxia = df_all['Hypoxia_Score'].quantile(0.75)
+th_homeo = df_all['Homeostatic_Score'].quantile(0.50)
+
+# Classification Logic Function
+def classify_state(row):
+    # Check for pathological stress
+    is_inflamed = row['Inflammation_Score'] > th_inflam
+    is_hypoxic = row['Hypoxia_Score'] > th_hypoxia
+    
+    if is_inflamed or is_hypoxic:
+        if row['Inflammation_Score'] > row['Hypoxia_Score']:
+            return 'Inflammation-Driven'
+        else:
+            return 'Hypoxia-Driven'
+    else:
+        # If not pathological, is it healthy?
+        if row['Homeostatic_Score'] > th_homeo:
+            return 'Healthy (Homeostatic)'
+        else:
+            return 'Degenerative/Quiescent'
+
+df_all['Astro_State'] = df_all.apply(classify_state, axis=1)
+
+# ==============================================================================
+# 4. Quantification and Visualization (WM vs GM / WT vs 5xFAD)
+# ==============================================================================
+output_dir = "Visium_HD_Final_Quantification"
+os.makedirs(output_dir, exist_ok=True)
+
+print("\n[Quantification] Analyzing and plotting graphs...")
+
+# (1) Aggregate Data (Groupby)
+# Calculate State proportions within Condition(WT/5xFAD) -> Region(WM/GM)
+# Using normalize='index' to convert to percentage (%)
+counts = df_all.groupby(['Condition', 'Region_Type', 'Astro_State']).size().unstack(fill_value=0)
+props = counts.div(counts.sum(axis=1), axis=0) * 100
+
+print("\n[Quantification Results Table (%)]")
+print(props)
+props.to_csv(f"{output_dir}/Astrocyte_State_Proportions.csv")
+
+# (2) Draw Bar Plot
+# Color Mapping
+state_colors = {
+    'Healthy (Homeostatic)': '#1f77b4',       # Blue
+    'Inflammation-Driven': '#d62728',         # Red
+    'Hypoxia-Driven': '#17becf',              # Teal
+    'Degenerative/Quiescent': '#7f7f7f'       # Gray
+}
+
+# Plotting (1 Row, 2 Columns: WT vs 5xFAD / X-axis: Region)
+fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
+
+conditions = ['WT', '5xFAD']
+for i, cond in enumerate(conditions):
+    # Extract data for condition (Order: GM, WM)
+    subset = props.loc[cond] 
+    
+    # Stacked Bar Plot
+    subset.plot(kind='bar', stacked=True, ax=axes[i], color=[state_colors[c] for c in subset.columns], width=0.6)
+    
+    axes[i].set_title(f"{cond} Condition", fontsize=16, fontweight='bold')
+    axes[i].set_xlabel("Brain Region", fontsize=14)
+    if i == 0:
+        axes[i].set_ylabel("Proportion of Astrocytes (%)", fontsize=14)
+    else:
+        axes[i].set_ylabel("")
+        
+    axes[i].tick_params(axis='x', rotation=0)
+    axes[i].grid(axis='y', linestyle='--', alpha=0.3)
+    
+    # Legend only on the right graph
+    if i == 1:
+        axes[i].legend(title="Astrocyte State", bbox_to_anchor=(1.05, 1), loc='upper left')
+    else:
+        axes[i].get_legend().remove()
+
+plt.suptitle("Astrocyte State Distribution by Region & Condition", fontsize=18)
+plt.tight_layout()
+save_path = f"{output_dir}/Quantification_BarPlot_WM_vs_GM.png"
+plt.savefig(save_path, dpi=300, bbox_inches='tight')
+plt.close()
+
+print(f"\n[Done] Results saved: {save_path}")
+print(" -> Please check the graph to confirm the surge in 'Hypoxia' and 'Degenerative' proportions in 5xFAD WM.")
+try: os.startfile(output_dir)
+except: pass
